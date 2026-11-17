@@ -124,6 +124,46 @@ WHEN (ABS(NEW.variance) < 1e-9 AND NEW.disposition <> 'balanced')
 BEGIN
   SELECT RAISE(ABORT, 'variance sign and disposition disagree');
 END;
+
+-- 金额同源：长短款行金额必须等于其批次差额（插入与改写都拦截）。
+CREATE TRIGGER IF NOT EXISTS trg_variance_amount_matches_batch
+BEFORE INSERT ON variance_rows
+WHEN ABS(NEW.variance - (SELECT variance FROM close_batches WHERE id = NEW.batch_id)) > 1e-9
+BEGIN
+  SELECT RAISE(ABORT, 'variance amount must equal batch variance');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_variance_update_amount_matches_batch
+BEFORE UPDATE OF variance, batch_id ON variance_rows
+WHEN ABS(NEW.variance - (SELECT variance FROM close_batches WHERE id = NEW.batch_id)) > 1e-9
+BEGIN
+  SELECT RAISE(ABORT, 'variance amount must equal batch variance');
+END;
+
+-- 终态与方向在改写时同样不可倒退（pending 不得经 UPDATE 复活）。
+CREATE TRIGGER IF NOT EXISTS trg_variance_update_disposition_final
+BEFORE UPDATE OF disposition ON variance_rows
+WHEN NEW.disposition NOT IN ({",".join(f"'{d}'" for d in FINAL_DISPOSITIONS)})
+BEGIN
+  SELECT RAISE(ABORT, 'variance disposition must be final (balanced/loss/gain)');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_variance_update_direction
+BEFORE UPDATE OF variance, disposition ON variance_rows
+WHEN (ABS(NEW.variance) < 1e-9 AND NEW.disposition <> 'balanced')
+  OR (NEW.variance < -1e-9 AND NEW.disposition <> 'loss')
+  OR (NEW.variance > 1e-9 AND NEW.disposition <> 'gain')
+BEGIN
+  SELECT RAISE(ABORT, 'variance sign and disposition disagree');
+END;
+
+-- 已 sealed 批次的长短款行不可删除（防「已 sealed 无长短款行」）。
+CREATE TRIGGER IF NOT EXISTS trg_variance_delete_sealed_batch
+BEFORE DELETE ON variance_rows
+WHEN EXISTS (SELECT 1 FROM close_batches WHERE id = OLD.batch_id AND status = 'sealed')
+BEGIN
+  SELECT RAISE(ABORT, 'cannot delete variance row of sealed batch');
+END;
 '''
 
 

@@ -126,16 +126,72 @@ def pending_days(conn: sqlite3.Connection) -> list[str]:
     本策略禁止 pending，因此这里只会返回历史脏数据（例如旧策略遗留），
     用于日锁定审计与运维处置，不会由正常封账流程产生。
     """
+    placeholders = ",".join("?" for _ in FINAL_DISPOSITIONS)
     return [
         r["business_day"]
         for r in conn.execute(
-            "SELECT DISTINCT business_day FROM variance_rows WHERE disposition NOT IN ('balanced','loss','gain') ORDER BY business_day"
+            f"SELECT DISTINCT business_day FROM variance_rows WHERE disposition NOT IN ({placeholders}) ORDER BY business_day",
+            tuple(FINAL_DISPOSITIONS),
         ).fetchall()
     ]
 
 
 def list_variances(conn: sqlite3.Connection) -> list[dict[str, Any]]:
     return [dict(r) for r in conn.execute("SELECT * FROM variance_rows ORDER BY id DESC").fetchall()]
+
+
+def day_pending_count(conn: sqlite3.Connection, business_day: str) -> int:
+    """该营业日未终态（pending 等）长短款行数；>0 时禁止封账/重封。"""
+    placeholders = ",".join("?" for _ in FINAL_DISPOSITIONS)
+    row = conn.execute(
+        f"SELECT COUNT(*) c FROM variance_rows WHERE business_day=? AND disposition NOT IN ({placeholders})",
+        (business_day, *FINAL_DISPOSITIONS),
+    ).fetchone()
+    return int(row["c"])
+
+
+def open_variance_count(conn: sqlite3.Connection) -> int:
+    """总览未决计数：非终态处置行 + 已 sealed 却无终态处置行的批次。
+
+    「已 sealed 无长短款行」与「pending 仍当已清」都计入未决，
+    只有两者同时归零，总览才允许显示 0。
+    """
+    placeholders = ",".join("?" for _ in FINAL_DISPOSITIONS)
+    final = tuple(FINAL_DISPOSITIONS)
+    non_final = conn.execute(
+        f"SELECT COUNT(*) c FROM variance_rows WHERE disposition NOT IN ({placeholders})",
+        final,
+    ).fetchone()["c"]
+    sealed_without = conn.execute(
+        f'''
+        SELECT COUNT(*) c FROM close_batches b
+        WHERE b.status='sealed'
+          AND NOT EXISTS (
+            SELECT 1 FROM variance_rows v
+            WHERE v.batch_id=b.id AND v.disposition IN ({placeholders})
+          )
+        ''',
+        final,
+    ).fetchone()["c"]
+    return int(non_final) + int(sealed_without)
+
+
+def update_variance_row(
+    conn: sqlite3.Connection, row_id: int, *, variance: float, disposition: str, note: str | None
+) -> None:
+    """以批次快照为准回写长短款行（金额与 disposition 同源）。"""
+    conn.execute(
+        "UPDATE variance_rows SET variance=?, disposition=?, note=? WHERE id=?",
+        (variance, disposition, note, row_id),
+    )
+
+
+def delete_variance_row(conn: sqlite3.Connection, row_id: int) -> None:
+    conn.execute("DELETE FROM variance_rows WHERE id=?", (row_id,))
+
+
+def set_batch_status(conn: sqlite3.Connection, batch_id: int, status: str) -> None:
+    conn.execute("UPDATE close_batches SET status=? WHERE id=?", (status, batch_id))
 
 
 def integrity_violations(conn: sqlite3.Connection) -> list[dict[str, Any]]:
@@ -196,6 +252,26 @@ def integrity_violations(conn: sqlite3.Connection) -> list[dict[str, Any]]:
                 "business_day": row["business_day"],
                 "batch_id": row["batch_id"],
                 "detail": f"差额 {row['variance']} 与处置 {row['disposition']} 方向不符",
+            }
+        )
+
+    for row in conn.execute(
+        '''
+        SELECT v.id, v.business_day, v.batch_id, v.variance AS row_variance, b.variance AS batch_variance
+        FROM variance_rows v
+        JOIN close_batches b ON b.id=v.batch_id
+        WHERE ABS(v.variance - b.variance) > ?
+        ''',
+        (_ZERO,),
+    ).fetchall():
+        violations.append(
+            {
+                "code": "variance_amount_mismatch",
+                "business_day": row["business_day"],
+                "batch_id": row["batch_id"],
+                "detail": (
+                    f"长短款行金额 {row['row_variance']} 与批次差额 {row['batch_variance']} 不同源"
+                ),
             }
         )
 

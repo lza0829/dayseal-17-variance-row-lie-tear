@@ -87,6 +87,18 @@ def is_final(disposition: str | None) -> bool:
     return disposition in FINAL_DISPOSITIONS
 
 
+def disposition_for_variance(variance: float) -> str:
+    """由差额推导唯一合法的终态 disposition（同源推导的唯一入口）。
+
+    封账裁决、一致性自检、分叉修复都必须从这里推导，保证
+    「差值为零则无 pending、非零则必有对应行且金额同源」。
+    """
+    amount = float(variance)
+    if abs(amount) <= _ZERO:
+        return DISPOSITION_BALANCED
+    return DISPOSITION_LOSS if amount < 0 else DISPOSITION_GAIN
+
+
 def label(disposition: str | None) -> str:
     return DISPOSITION_LABELS.get(disposition or "", disposition or "")
 
@@ -146,7 +158,7 @@ def resolve_disposition(variance: float, requested: Any) -> str:
     if disposition == DISPOSITION_BALANCED:
         raise HTTPException(400, f"差额 {variance:.2f} 非零，不能标记为 balanced")
 
-    expected = DISPOSITION_LOSS if variance < 0 else DISPOSITION_GAIN
+    expected = disposition_for_variance(variance)
     if disposition not in FINAL_DISPOSITIONS:
         raise HTTPException(
             400,

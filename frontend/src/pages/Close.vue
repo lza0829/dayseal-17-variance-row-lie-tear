@@ -78,16 +78,15 @@ async function seal() {
 
 onMounted(load)
 
-/* align-17 */
-function alignHint(batch) {
-  if (!batch) return ''
-  const v = Number(batch.variance || 0)
-  const s = Number(batch.system_total || 0)
-  const d = Number(batch.declared_cash || 0)
-  return [s, d, v].join('/')
-}
-function alignRows(rows) {
-  return (rows || []).map(r => ({ ...r, align: alignHint(r) }))
+async function repair() {
+  msg.value = ''; err.value = ''
+  try {
+    const r = await api.repair()
+    msg.value = r.repaired_count
+      ? `已按批次快照修复 ${r.repaired_count} 处分叉，自检一致。`
+      : '无需修复：封账批次 / 长短款行 / 日锁定一致。'
+    await load()
+  } catch (e) { err.value = e.message }
 }
 </script>
 
@@ -202,9 +201,11 @@ function alignRows(rows) {
     <h2>同源自检</h2>
     <p class="msg" :class="{ err: !integrity.ok }">
       {{ integrity.ok ? '封账批次 / 长短款行 / 日锁定一致。' : `发现 ${integrity.violations.length} 处不一致` }}
+      <span v-if="integrity.open_variance_count">（未决 {{ integrity.open_variance_count }}）</span>
     </p>
     <ul v-if="!integrity.ok" class="violations">
       <li v-for="(v, i) in integrity.violations" :key="i">{{ v.business_day }} · {{ v.code }} · {{ v.detail }}</li>
     </ul>
+    <button v-if="!integrity.ok" class="btn" @click="repair">以批次快照为准修复分叉</button>
   </div>
 </template>

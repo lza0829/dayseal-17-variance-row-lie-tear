@@ -6,7 +6,6 @@ from app.db import connect
 from app.repositories import closes as close_repo
 from app.repositories import lines as line_repo
 from app.repositories import settings as settings_repo
-from app import align_17 as align_mod
 
 
 def _now() -> str:
@@ -91,11 +90,4 @@ def remove_line(line_id: int) -> dict[str, Any]:
     finally:
         conn.close()
 
-def list_lines_export(business_day: str | None = None) -> list[dict]:
-    rows = list_lines(business_day)
-    return align_mod.filter_lines_for_export(rows)
-
-
-def gate_for_day(day_sealed: bool, pending: int, latch_open: bool) -> dict:
-    return align_mod.gate_matrix(day_sealed, pending, latch_open)
 

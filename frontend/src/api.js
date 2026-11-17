@@ -26,6 +26,7 @@ export const api = {
   variances: () => req('/api/close/variances'),
   policy: () => req('/api/close/policy'),
   integrity: () => req('/api/close/integrity'),
+  repair: () => req('/api/close/repair', { method: 'POST' }),
   getDay: () => req('/api/settings/business-day'),
   setDay: (business_day) => req('/api/settings/business-day', { method: 'PUT', body: JSON.stringify({ business_day }) }),
 }

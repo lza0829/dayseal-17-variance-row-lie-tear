@@ -21,10 +21,6 @@ onMounted(async () => {
 function batchNo(id) {
   return batches.value.find((b) => b.id === id)?.batch_no || `#${id}`
 }
-
-function normalizeVar(rows) {
-  return (rows || []).map(r => ({ ...r, disposition: r.disposition || 'balanced' }))
-}
 </script>
 
 <template>

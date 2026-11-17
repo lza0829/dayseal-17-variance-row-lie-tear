@@ -21,11 +21,26 @@
   不生成封账批次、不写长短款行、不锁日。
 - 批次、补录流水、长短款行、日锁定在同一事务写入；`sealed` 与处置行、日锁定同源。
 - DB 触发器兜底：`sealed` 批次必须已有最终处置行；`variance_rows.disposition` 只允许
-  `balanced/loss/gain`，且必须与差额方向一致；一个营业日最多一个 `sealed` 批次。
+  `balanced/loss/gain`，且必须与差额方向一致；长短款行金额必须等于批次差额（金额同源，
+  插入与改写都拦截）；终态行不得经 UPDATE 退回 `pending`；已 sealed 批次的长短款行不可删除；
+  一个营业日最多一个 `sealed` 批次。
 - 已封账营业日继续拒写流水（新增/修改/删除均 409）。
-- 自检接口 `GET /api/close/integrity` 暴露「已 sealed 却无长短款行」「处置与差额方向不符」等问题。
+- 解封/重封闸：当日存在未终态（`pending` 等历史遗留）长短款行时，任何封账/重封 409 拒绝，
+  须先修复对齐；已 `sealed` 的营业日一律禁止重封。
+- 自检接口 `GET /api/close/integrity` 暴露「已 sealed 却无长短款行」「行额≠批差」
+  「处置与差额方向不符」「非终态处置」等分叉；总览 `open_variance_count` 把
+  「非终态行」与「已 sealed 无行」都计入未决，两者同归零才显示 0。
+- 修复接口 `POST /api/close/repair`：以批次合计与实盘快照为唯一权威，补齐缺失的长短款行、
+  按批次差额回写行额与 disposition、将 `pending` 改判终态、作废无批次孤儿行、
+  同日多 sealed 只留最新；修复后自检必须归零（幂等）。
 
 处置记录不是备注文案：`variance_rows.disposition` 是状态字段，`note` 只是说明。
+
+## 分叉夹具
+
+`backend/tests/test_divergence_closure.py` 用「老库」（无 CHECK/触发器的遗留表）埋入三类分叉
+互证：「有差无行」「行额≠批差」「pending 仍解封」——先证明自检/总览/封账闸能识别并拦截，
+再证明 `repair` 以批次快照同源收口、未决计数归零。
 
 ## 启动
 

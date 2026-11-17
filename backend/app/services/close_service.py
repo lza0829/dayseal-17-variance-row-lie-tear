@@ -10,11 +10,10 @@ from app.variance_policy import (
     DISPOSITION_LABELS,
     DISPOSITION_BALANCED,
     describe as describe_policy,
+    disposition_for_variance,
     label as disposition_label,
     resolve_disposition,
 )
-from app import variance_sync
-from app import align_17 as align_mod
 
 
 def _now() -> str:
@@ -121,6 +120,16 @@ def seal(body: dict[str, Any]) -> dict[str, Any]:
         if state["sealed"]:
             batch_no = state["batch"]["batch_no"] if state["batch"] else ""
             raise HTTPException(409, f"营业日 {day} 已封账（{batch_no}），禁止重封")
+
+        # 解封/重封闸：当日存在未终态（pending 等）长短款行时，矛盾未清，
+        # 不得放行新的封账；须先以批次快照为准修复对齐。
+        pending = close_repo.day_pending_count(conn, day)
+        if pending:
+            raise HTTPException(
+                409,
+                f"营业日 {day} 存在 {pending} 条未处置（pending）长短款行，"
+                "矛盾未清不得封账/重封；请先调用 POST /api/close/repair 以批次快照为准对齐",
+            )
 
         if "declared_cash" not in body:
             raise HTTPException(400, "缺少实盘现金 declared_cash")
@@ -251,25 +260,130 @@ def integrity() -> dict[str, Any]:
             "ok": not violations,
             "policy": describe_policy(),
             "pending_days": close_repo.pending_days(conn),
+            "open_variance_count": close_repo.open_variance_count(conn),
             "violations": violations,
         }
     finally:
         conn.close()
 
 
+def repair() -> dict[str, Any]:
+    """以批次合计与实盘快照为准，重算/补齐长短款行与 disposition。
+
+    全局唯一收口方向（与封账策略同源）：
+      * 已 sealed 无长短款行      → 以批次差额补齐终态行（金额同源）；
+      * 行额≠批差 / 方向不符      → 以批次差额回写，disposition 由差额推导；
+      * pending 等非终态行        → 以其批次快照改判终态，不得继续挂起；
+      * 无批次的孤儿行            → 无快照可依，作废删除；
+      * 同日多个 sealed 批次      → 保留最新 sealed，其余降为 draft。
+    修复不新造差额、不改批次快照本身；完成后自检必须归零。
+    """
+    conn = connect(immediate=True)
+    try:
+        before = close_repo.integrity_violations(conn)
+        actions: list[dict[str, Any]] = []
+
+        # 1) 同日多个 sealed 批次：只留最新一个 sealed，其余降为 draft。
+        dup_days = conn.execute(
+            "SELECT business_day FROM close_batches WHERE status='sealed' "
+            "GROUP BY business_day HAVING COUNT(*) > 1"
+        ).fetchall()
+        for d in dup_days:
+            day = d["business_day"]
+            sealed = conn.execute(
+                "SELECT id FROM close_batches WHERE business_day=? AND status='sealed' ORDER BY id DESC",
+                (day,),
+            ).fetchall()
+            for old in sealed[1:]:
+                close_repo.set_batch_status(conn, int(old["id"]), "draft")
+                actions.append(
+                    {"code": "demote_duplicate_sealed", "business_day": day,
+                     "batch_id": int(old["id"]), "detail": "同日多 sealed，降为 draft"}
+                )
+
+        # 2) 逐批次对齐长短款行：批次快照是唯一权威来源。
+        batches = conn.execute(
+            "SELECT id, batch_no, business_day, variance, status FROM close_batches ORDER BY id"
+        ).fetchall()
+        for b in batches:
+            batch_id = int(b["id"])
+            expected = disposition_for_variance(float(b["variance"]))
+            row = close_repo.variance_for_batch(conn, batch_id)
+            if row is None:
+                if b["status"] != "sealed":
+                    continue  # draft 批次未生效，封账时会重算，不补行
+                # 有差无行：走 draft→补行→重封，与正常封账同一套触发器路径。
+                close_repo.set_batch_status(conn, batch_id, "draft")
+                close_repo.add_variance(
+                    conn,
+                    batch_id=batch_id,
+                    business_day=b["business_day"],
+                    variance=float(b["variance"]),
+                    disposition=expected,
+                    note="分叉修复：以批次快照补齐长短款行",
+                    created_at=_now(),
+                )
+                close_repo.seal_batch(conn, batch_id)
+                actions.append(
+                    {"code": "backfill_variance_row", "business_day": b["business_day"],
+                     "batch_id": batch_id,
+                     "detail": f"{b['batch_no']} 补齐长短款行 {float(b['variance']):+.2f}/{expected}"}
+                )
+            elif (
+                abs(float(row["variance"]) - float(b["variance"])) > 1e-9
+                or row["disposition"] != expected
+            ):
+                # 行额≠批差 / 方向不符 / pending：以批次快照回写同源终态。
+                close_repo.update_variance_row(
+                    conn,
+                    int(row["id"]),
+                    variance=float(b["variance"]),
+                    disposition=expected,
+                    note=row.get("note") or "分叉修复：以批次快照回写",
+                )
+                actions.append(
+                    {"code": "rewrite_variance_row", "business_day": b["business_day"],
+                     "batch_id": batch_id,
+                     "detail": (
+                         f"行 {row['id']} 由 {float(row['variance']):+.2f}/{row['disposition']} "
+                         f"回写为 {float(b['variance']):+.2f}/{expected}"
+                     )}
+                )
+
+        # 3) 孤儿长短款行：无批次快照可依，作废。
+        orphans = conn.execute(
+            "SELECT v.id, v.business_day FROM variance_rows v "
+            "LEFT JOIN close_batches b ON b.id=v.batch_id WHERE b.id IS NULL"
+        ).fetchall()
+        for o in orphans:
+            close_repo.delete_variance_row(conn, int(o["id"]))
+            actions.append(
+                {"code": "drop_orphan_variance", "business_day": o["business_day"],
+                 "batch_id": None, "detail": f"作废无批次的长短款行 {int(o['id'])}"}
+            )
+
+        after = close_repo.integrity_violations(conn)
+        if after:
+            raise HTTPException(500, f"分叉修复后自检仍未归零：{after}")
+
+        conn.commit()
+        return {
+            "ok": True,
+            "policy": describe_policy(),
+            "repaired_count": len(actions),
+            "actions": actions,
+            "violations_before": before,
+            "violations_after": after,
+            "pending_days": close_repo.pending_days(conn),
+            "open_variance_count": close_repo.open_variance_count(conn),
+        }
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
+
 def disposition_options() -> dict[str, str]:
     return dict(DISPOSITION_LABELS)
-
-def list_batches_extended() -> list[dict]:
-    rows = list_batches()
-    summary = align_mod.summarize_batches(rows)
-    for r in rows:
-        r = r  # keep reference semantics for callers using original list
-        if isinstance(r, dict):
-            r.setdefault("alignment", summary.get("alignment_token") if False else summary.get("sealed_count"))
-    return rows
-
-
-def preview_reconcile(system_total: float, declared: float) -> dict:
-    return align_mod.reconcile_hint(system_total, declared)
 

@@ -6,7 +6,6 @@ from app.repositories import lines as line_repo
 from app.repositories import settings as settings_repo
 from app.repositories import tills as till_repo
 from app.variance_policy import describe as describe_policy, label as disposition_label
-from app import align_17 as align_mod
 
 
 def dashboard() -> dict[str, Any]:
@@ -26,28 +25,9 @@ def dashboard() -> dict[str, Any]:
             "disposition_label": disposition_label(state["disposition"]),
             "variance_policy": describe_policy(),
             "close_batch_count": conn.execute("SELECT COUNT(*) c FROM close_batches").fetchone()["c"],
-            "open_variance_count": conn.execute(
-                "SELECT COUNT(*) c FROM variance_rows WHERE disposition NOT IN ('balanced','loss','gain')"
-            ).fetchone()["c"],
+            "open_variance_count": close_repo.open_variance_count(conn),
             "integrity_violation_count": len(close_repo.integrity_violations(conn)),
         }
-    finally:
-        conn.close()
-
-
-def dashboard_aligned() -> dict:
-    raw = dashboard()
-    return raw
-
-def dashboard_extended() -> dict:
-    from app.db import connect
-    from app.repositories import closes as close_repo
-    from app import align_17 as align_mod
-    base = dashboard()
-    conn = connect()
-    try:
-        batches = close_repo.list_batches(conn)
-        return align_mod.overlay_dashboard(base, batches)
     finally:
         conn.close()
 

@@ -32,3 +32,8 @@ def variances():
 @router.get("/integrity")
 def integrity():
     return svc.integrity()
+
+
+@router.post("/repair")
+def repair():
+    return svc.repair()
